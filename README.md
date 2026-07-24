@@ -14,6 +14,8 @@ Instead of a dashboard you read, it's a data layer your agent queries.
 | `fetch_reddit` | Reddit creds | Pull posts from subreddits like r/SomebodyMakeThis |
 | `check_novelty` | No | Search HN for prior art on an idea — returns evidence, not verdicts; your agent judges similarity |
 | `detect_gaps` | `ANTHROPIC_API_KEY` | Fetch posts and run LLM analysis to surface demand-supply gaps with cited evidence |
+| `watch_gap` / `unwatch_gap` / `list_watches` | No | Manage a persistent watchlist of gaps to track (stored locally in `~/.idea-forge/watchlist.db`) |
+| `check_velocity` | No | Snapshot a watched gap's demand signals (posts/points/comments per day) and report the delta vs. the previous check — is demand accelerating? |
 
 Design principle: **evidence over opinion.** Tools return raw, verifiable signals (posts, points, comments, quotes) and leave the judgment to the agent — no black-box "idea scores."
 

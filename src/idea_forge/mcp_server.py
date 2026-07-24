@@ -15,13 +15,16 @@ from anthropic import AsyncAnthropic
 from mcp.server.fastmcp import FastMCP
 from pydantic import ValidationError
 
-from idea_forge.config import Settings
+from idea_forge.config import Settings, resolve_velocity_db_path
 from idea_forge.gaps.detector import GapDetector
 from idea_forge.gaps.errors import GapDetectionError
 from idea_forge.ingestion.base import RawDocument
 from idea_forge.ingestion.errors import AuthError, IngestionError
 from idea_forge.ingestion.hackernews import HackerNewsAdapter
 from idea_forge.ingestion.reddit import RedditAdapter
+from idea_forge.velocity.errors import DuplicateWatchError, StorageError, WatchNotFoundError
+from idea_forge.velocity.service import VelocityService
+from idea_forge.velocity.store import WatchStore
 
 logger = logging.getLogger("idea_forge.mcp_server")
 
@@ -402,6 +405,170 @@ async def detect_gaps(
         "Error: ". Missing ANTHROPIC_API_KEY yields the friendly guidance message.
     """
     return await _detect_gaps_impl(source, tags, query, limit)
+
+
+async def _velocity_service(settings: Settings) -> VelocityService:
+    db_path = resolve_velocity_db_path(settings)
+    store = WatchStore(db_path)
+    await store.init()
+    return VelocityService(settings, store)
+
+
+async def _watch_gap_impl(name: str, query: str, tags: str = "story") -> str:
+    """Return JSON string of the created Watch or a friendly 'Error: ...' string."""
+    clean_name = name.strip()
+    if not clean_name:
+        return "Error: name must not be empty."
+    clean_query = query.strip()[:NOVELTY_QUERY_MAX_CHARS]
+    if not clean_query:
+        return "Error: query must not be empty."
+
+    tag_list = (
+        ["story"] if _is_blank_csv(tags) else [t.strip() for t in tags.split(",") if t.strip()]
+    )
+
+    try:
+        settings = _base_settings(require_reddit=False)
+        service = await _velocity_service(settings)
+        watch = await service.watch_gap(clean_name, clean_query, tag_list)
+        return json.dumps(watch.model_dump(mode="json"), ensure_ascii=False)
+    except DuplicateWatchError:
+        return (
+            f"Error: watch '{clean_name}' already exists. "
+            "Call unwatch_gap first or pick another name."
+        )
+    except StorageError as exc:
+        logger.exception("watch_gap storage failed")
+        return f"Error: StorageError: {exc}"
+    except Exception as exc:
+        logger.exception("watch_gap failed")
+        return f"Error: {type(exc).__name__}: {exc}"
+
+
+async def _unwatch_gap_impl(name: str) -> str:
+    """Return JSON string {"removed": name} or a friendly 'Error: ...' string."""
+    clean_name = name.strip()
+    if not clean_name:
+        return "Error: name must not be empty."
+
+    try:
+        settings = _base_settings(require_reddit=False)
+        service = await _velocity_service(settings)
+        await service.unwatch_gap(clean_name)
+        return json.dumps({"removed": clean_name}, ensure_ascii=False)
+    except WatchNotFoundError:
+        return f"Error: no watch named '{clean_name}'."
+    except StorageError as exc:
+        logger.exception("unwatch_gap storage failed")
+        return f"Error: StorageError: {exc}"
+    except Exception as exc:
+        logger.exception("unwatch_gap failed")
+        return f"Error: {type(exc).__name__}: {exc}"
+
+
+async def _list_watches_impl() -> str:
+    """Return JSON string {"watches": [...], "count": N} or a friendly 'Error: ...' string."""
+    try:
+        settings = _base_settings(require_reddit=False)
+        service = await _velocity_service(settings)
+        result = await service.list_watches()
+        return json.dumps(result.model_dump(mode="json"), ensure_ascii=False)
+    except StorageError as exc:
+        logger.exception("list_watches storage failed")
+        return f"Error: StorageError: {exc}"
+    except Exception as exc:
+        logger.exception("list_watches failed")
+        return f"Error: {type(exc).__name__}: {exc}"
+
+
+async def _check_velocity_impl(name: str) -> str:
+    """Return JSON string of the VelocityReport or a friendly 'Error: ...' string."""
+    clean_name = name.strip()
+    if not clean_name:
+        return "Error: name must not be empty."
+
+    try:
+        settings = _base_settings(require_reddit=False)
+        service = await _velocity_service(settings)
+        report = await service.check_velocity(clean_name)
+        return json.dumps(report.model_dump(mode="json"), ensure_ascii=False)
+    except WatchNotFoundError:
+        return f"Error: no watch named '{clean_name}'. Call watch_gap first."
+    except IngestionError as exc:
+        logger.exception("check_velocity fetch failed")
+        return f"Error: {type(exc).__name__}: {exc}"
+    except StorageError as exc:
+        logger.exception("check_velocity storage failed")
+        return f"Error: StorageError: {exc}"
+    except Exception as exc:
+        logger.exception("check_velocity failed")
+        return f"Error: {type(exc).__name__}: {exc}"
+
+
+@mcp.tool()
+async def watch_gap(name: str, query: str, tags: str = "story") -> str:
+    """Register a gap/query to watch for demand velocity on Hacker News.
+
+    Persists a named watch (query + Algolia tags) to a local SQLite watchlist so
+    future check_velocity calls can compare snapshots over time.
+
+    Args:
+        name: unique handle for this watch (you choose it).
+        query: free-text query sent to Hacker News search (e.g. "ai code review").
+        tags: comma-separated Algolia tags (default "story").
+
+    Returns:
+        A JSON string of the created Watch, or "Error: ..." (e.g. duplicate name).
+    """
+    return await _watch_gap_impl(name, query, tags)
+
+
+@mcp.tool()
+async def unwatch_gap(name: str) -> str:
+    """Remove a watch (and its snapshot history) from the watchlist.
+
+    Args:
+        name: the watch's unique handle, as passed to watch_gap.
+
+    Returns:
+        A JSON string {"removed": name}, or "Error: ..." if no such watch exists.
+    """
+    return await _unwatch_gap_impl(name)
+
+
+@mcp.tool()
+async def list_watches() -> str:
+    """List all registered gap watches.
+
+    Returns:
+        A JSON string {"watches": [Watch, ...], "count": N}, or "Error: ...".
+    """
+    return await _list_watches_impl()
+
+
+@mcp.tool()
+async def check_velocity(name: str) -> str:
+    """Check demand velocity for a watched gap: fetch fresh HN data, snapshot it,
+    and return the delta versus the previous snapshot as evidence (no opinion score).
+
+    Use this to see whether a gap is accelerating or cooling off. It fetches current
+    Hacker News signal for the watch's query/tags, records a snapshot, and diffs it
+    against the previous snapshot (if any) for this watch — post/point/comment counts,
+    per-day rates, and their deltas. You judge whether that's "accelerating" yourself;
+    this tool never assigns a score or opinion.
+
+    Watch for `fetch_limit_hit: true` in either snapshot — it means the fetch hit its
+    cap while the oldest fetched post was still inside the time window, so counts for
+    that snapshot are an undercount rather than the true total.
+
+    Args:
+        name: the watch's unique handle, as passed to watch_gap.
+
+    Returns:
+        A JSON string of VelocityReport {"watch", "current", "previous", "delta",
+        "new_evidence", "note"}, or "Error: ..." (e.g. no watch with that name).
+    """
+    return await _check_velocity_impl(name)
 
 
 def _configure_logging() -> None:

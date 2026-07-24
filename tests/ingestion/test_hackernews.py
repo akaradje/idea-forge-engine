@@ -559,6 +559,21 @@ async def test_self_created_client_is_closed_on_aexit():
 
 
 @respx.mock
+async def test_fetch_single_tag_exceeding_retries_raises_ingestion_error(monkeypatch):
+    """Locks in the intentional behavior: when the only configured tag fails
+    after exhausting retries and no doc was ever yielded, fetch() must raise
+    IngestionError rather than silently yielding an empty stream."""
+    respx.get(SEARCH_URL).mock(return_value=httpx.Response(500))
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+
+    settings = make_settings(hn_tags=["ask_hn"], max_retries=1)
+    async with HackerNewsAdapter(settings) as adapter:
+        with pytest.raises(IngestionError):
+            async for _ in adapter.fetch():
+                pass
+
+
+@respx.mock
 async def test_empty_hn_tags_yields_nothing():
     route = respx.get(SEARCH_URL).mock(return_value=search_response([make_hit()]))
 

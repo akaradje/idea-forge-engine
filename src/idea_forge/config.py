@@ -1,10 +1,13 @@
 """Application settings loaded from environment / .env."""
 
 from functools import lru_cache
+from pathlib import Path
 from typing import Annotated
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+
+DEFAULT_VELOCITY_DB_PATH = Path("~/.idea-forge/watchlist.db")
 
 
 class Settings(BaseSettings):
@@ -40,6 +43,12 @@ class Settings(BaseSettings):
     gap_request_timeout_seconds: float = 120.0
     gap_max_output_tokens: int = 16000  # max_tokens budget for each gap-detection call
 
+    # Gap Velocity Alerts (watchlist + snapshots, local SQLite)
+    velocity_db_path: str = ""  # "" -> ~/.idea-forge/watchlist.db (resolved at use time)
+    velocity_window_days: int = 7
+    velocity_max_evidence: int = 10
+    velocity_limit_per_check: int = 100  # mapped to hn_limit_per_tag
+
     @field_validator("reddit_subreddits", mode="before")
     @classmethod
     def _split_csv(cls, v: object) -> object:
@@ -58,3 +67,12 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()  # type: ignore[call-arg]  # values sourced from env/.env at runtime
+
+
+def resolve_velocity_db_path(settings: Settings) -> Path:
+    """Resolve settings.velocity_db_path to an absolute Path, expanding "~" and
+    creating parent directories. "" falls back to ~/.idea-forge/watchlist.db."""
+    raw = settings.velocity_db_path.strip()
+    path = Path(raw).expanduser() if raw else DEFAULT_VELOCITY_DB_PATH.expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path

@@ -40,11 +40,19 @@ class HackerNewsAdapter(IngestionAdapter):
             await self._client.aclose()
 
     async def fetch(self) -> AsyncIterator[RawDocument]:
-        for tag in self.settings.hn_tags:
+        hn_tags = self.settings.hn_tags
+        yielded_any = False
+        failed = 0
+        last_error: Exception | None = None
+
+        for tag in hn_tags:
             try:
                 async for doc in self._fetch_tag(tag):
+                    yielded_any = True
                     yield doc
             except Exception as exc:
+                failed += 1
+                last_error = exc
                 logger.warning(
                     "hackernews tag fetch failed, skipping: source=%s tag=%s error=%s",
                     self.source,
@@ -52,6 +60,9 @@ class HackerNewsAdapter(IngestionAdapter):
                     exc,
                 )
                 continue
+
+        if failed == len(hn_tags) and not yielded_any and last_error is not None:
+            raise IngestionError(f"all hackernews tags failed: {last_error}") from last_error
 
     async def _sleep_backoff(self, attempt: int) -> None:
         delay = (2 ** (attempt - 1)) + random.uniform(0, 1)
