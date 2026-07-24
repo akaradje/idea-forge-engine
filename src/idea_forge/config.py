@@ -33,6 +33,13 @@ class Settings(BaseSettings):
     hn_limit_per_tag: int = 100  # hard cap on docs yielded per tag entry
     hn_page_size: int = 100  # Algolia hitsPerPage; clamped to [1, 1000] at request time
 
+    # Gap Detection (Anthropic)
+    anthropic_api_key: str = ""  # optional; SDK also reads ANTHROPIC_API_KEY env
+    gap_model: str = "claude-opus-4-8"
+    gap_max_docs_per_call: int = 50  # docs per Anthropic request; larger inputs batched
+    gap_request_timeout_seconds: float = 120.0
+    gap_max_output_tokens: int = 16000  # max_tokens budget for each gap-detection call
+
     @field_validator("reddit_subreddits", mode="before")
     @classmethod
     def _split_csv(cls, v: object) -> object:
