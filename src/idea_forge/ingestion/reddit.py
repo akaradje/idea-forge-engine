@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import math
 import random
 import time
 from collections.abc import AsyncIterator
@@ -21,6 +22,8 @@ from idea_forge.ingestion.errors import (
 )
 
 logger = logging.getLogger(__name__)
+
+MAX_RETRY_AFTER_SECONDS = 60.0
 
 _METADATA_FIELDS = (
     "subreddit",
@@ -167,6 +170,12 @@ class RedditAdapter(IngestionAdapter):
                         retry_after_seconds = float(retry_after)
                     except ValueError:
                         retry_after_seconds = None
+                    else:
+                        # a hostile/broken server must not park us on sleep(inf)
+                        if not math.isfinite(retry_after_seconds) or retry_after_seconds < 0:
+                            retry_after_seconds = None
+                        else:
+                            retry_after_seconds = min(retry_after_seconds, MAX_RETRY_AFTER_SECONDS)
                 if retry_after_seconds is not None:
                     await asyncio.sleep(retry_after_seconds)
                 else:

@@ -5,12 +5,12 @@ All HTTP is mocked via respx; no live network calls are made.
 """
 
 import asyncio
+import math
 from unittest.mock import AsyncMock
 
 import httpx
 import pytest
 import respx
-from idea_forge.ingestion.reddit import RedditAdapter
 
 from idea_forge.config import Settings
 from idea_forge.ingestion.base import RawDocument
@@ -20,6 +20,7 @@ from idea_forge.ingestion.errors import (
     RateLimitError,
     SubredditUnavailableError,
 )
+from idea_forge.ingestion.reddit import RedditAdapter
 
 TOKEN_URL = "https://www.reddit.com/api/v1/access_token"
 API_BASE = "https://oauth.reddit.com"
@@ -273,6 +274,32 @@ async def test_429_with_retry_after_sleeps_then_retries(monkeypatch):
     assert sleep_mock.await_count >= 1
     slept_for = sleep_mock.await_args_list[0].args[0]
     assert slept_for == pytest.approx(2, abs=1)
+
+
+@respx.mock
+@pytest.mark.parametrize("retry_after", ["inf", "nan", "-5", "999999"])
+async def test_429_hostile_retry_after_never_sleeps_unbounded(monkeypatch, retry_after):
+    respx.post(TOKEN_URL).mock(return_value=token_response())
+    respx.get(f"{API_BASE}/r/testsub/new").mock(
+        side_effect=[
+            httpx.Response(429, headers={"Retry-After": retry_after}),
+            listing_response([make_child(id="p1", title="Recovered")], after=None),
+        ]
+    )
+
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(asyncio, "sleep", sleep_mock)
+
+    settings = make_settings()
+    docs: list[RawDocument] = []
+    async with RedditAdapter(settings) as adapter:
+        async for doc in adapter.fetch():
+            docs.append(doc)
+
+    assert [d.title for d in docs] == ["Recovered"]
+    for call in sleep_mock.await_args_list:
+        delay = call.args[0]
+        assert math.isfinite(delay) and 0 <= delay <= 60
 
 
 @respx.mock

@@ -6,8 +6,9 @@ Covers spec acceptance criterion 16 (specs/2026-07-24-reddit-ingestion-adapter.m
 from pathlib import Path
 
 import pytest
-from idea_forge.config import Settings
 from pydantic import ValidationError
+
+from idea_forge.config import Settings
 
 REQUIRED_ENV = {
     "REDDIT_CLIENT_ID": "abc123",
@@ -96,6 +97,64 @@ def test_default_values_for_optional_settings(tmp_path):
     assert settings.reddit_top_time_filter == "week"
     assert settings.request_timeout_seconds == 10.0
     assert settings.max_retries == 3
+
+
+def test_hn_tags_parses_comma_separated_string(tmp_path):
+    env_file = _write_env(
+        tmp_path,
+        "\n".join(f"{k}={v}" for k, v in REQUIRED_ENV.items())
+        + "\n"
+        + 'HN_TAGS="ask_hn, show_hn"\n',
+    )
+    settings = Settings(_env_file=env_file)
+
+    assert settings.hn_tags == ["ask_hn", "show_hn"]
+
+
+def test_hn_tags_strips_whitespace_and_drops_empty_entries(tmp_path):
+    env_file = _write_env(
+        tmp_path,
+        "\n".join(f"{k}={v}" for k, v in REQUIRED_ENV.items())
+        + "\n"
+        + 'HN_TAGS=" ask_hn ,, show_hn ,story"\n',
+    )
+    settings = Settings(_env_file=env_file)
+
+    assert settings.hn_tags == ["ask_hn", "show_hn", "story"]
+
+
+def test_hn_tags_defaults_when_not_set(tmp_path):
+    env_file = _write_env(tmp_path, "\n".join(f"{k}={v}" for k, v in REQUIRED_ENV.items()) + "\n")
+    settings = Settings(_env_file=env_file)
+
+    assert settings.hn_tags == ["ask_hn", "show_hn"]
+
+
+def test_hn_default_values_for_optional_settings(tmp_path):
+    env_file = _write_env(tmp_path, "\n".join(f"{k}={v}" for k, v in REQUIRED_ENV.items()) + "\n")
+    settings = Settings(_env_file=env_file)
+
+    assert settings.hn_query == ""
+    assert settings.hn_limit_per_tag == 100
+    assert settings.hn_page_size == 100
+
+
+def test_loads_hn_fields_from_env_file(tmp_path):
+    env_file = _write_env(
+        tmp_path,
+        "\n".join(f"{k}={v}" for k, v in REQUIRED_ENV.items())
+        + "\n"
+        + 'HN_TAGS="ask_hn"\n'
+        + "HN_QUERY=widget\n"
+        + "HN_LIMIT_PER_TAG=50\n"
+        + "HN_PAGE_SIZE=20\n",
+    )
+    settings = Settings(_env_file=env_file)
+
+    assert settings.hn_tags == ["ask_hn"]
+    assert settings.hn_query == "widget"
+    assert settings.hn_limit_per_tag == 50
+    assert settings.hn_page_size == 20
 
 
 def test_get_settings_returns_cached_instance(tmp_path, monkeypatch):
