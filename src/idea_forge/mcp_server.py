@@ -6,14 +6,18 @@ stderr. Never print()/log to stdout in this module.
 
 import json
 import logging
+import os
 import sys
 from collections.abc import AsyncGenerator
 from typing import Any, cast
 
+from anthropic import AsyncAnthropic
 from mcp.server.fastmcp import FastMCP
 from pydantic import ValidationError
 
 from idea_forge.config import Settings
+from idea_forge.gaps.detector import GapDetector
+from idea_forge.gaps.errors import GapDetectionError
 from idea_forge.ingestion.base import RawDocument
 from idea_forge.ingestion.errors import AuthError, IngestionError
 from idea_forge.ingestion.hackernews import HackerNewsAdapter
@@ -23,6 +27,8 @@ logger = logging.getLogger("idea_forge.mcp_server")
 
 MAX_BODY_CHARS = 2000  # RawDocument.body truncated to this before serialization
 MAX_LIMIT = 100  # per-call limit clamp ceiling
+MAX_NOVELTY_RESULTS = 20  # ceiling for check_novelty max_results
+NOVELTY_QUERY_MAX_CHARS = 300  # idea string truncated to this before hitting Algolia
 
 _REDDIT_CREDS_ERROR = (
     "Error: Reddit credentials not configured. Set REDDIT_CLIENT_ID, "
@@ -31,6 +37,15 @@ _REDDIT_CREDS_ERROR = (
 
 _REDDIT_REQUIRED_FIELDS = frozenset(
     {"reddit_client_id", "reddit_client_secret", "reddit_user_agent"}
+)
+
+_ANTHROPIC_MISSING_MSG = (
+    "ANTHROPIC_API_KEY is not set, so detect_gaps cannot run its LLM analysis. "
+    "Two options:\n"
+    "  1. Set it: add ANTHROPIC_API_KEY=sk-ant-... to your .env (or export it in the "
+    "environment) and call detect_gaps again.\n"
+    "  2. Keyless alternative: call fetch_hackernews to pull the same posts, then "
+    "analyze them for demand-supply gaps yourself — you are an LLM."
 )
 
 mcp = FastMCP("idea-forge-ingestion")
@@ -214,6 +229,179 @@ async def fetch_reddit(
         limit_per_subreddit: max documents per subreddit.
     """
     return await _fetch_reddit_impl(subreddits, listing, limit_per_subreddit)
+
+
+def _anthropic_key_present(settings: Settings) -> bool:
+    """True if settings.anthropic_api_key is non-blank OR ANTHROPIC_API_KEY env is set."""
+    return bool(settings.anthropic_api_key.strip()) or bool(
+        os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    )
+
+
+def _hn_prior_art_entry(doc: RawDocument) -> dict[str, Any]:
+    """Compact prior-art record: unique_key, title, url, points, num_comments,
+    created_at (ISO string). points/num_comments from doc.metadata; absent → None."""
+    return {
+        "unique_key": doc.unique_key,
+        "title": doc.title,
+        "url": doc.url,
+        "points": doc.metadata.get("points"),
+        "num_comments": doc.metadata.get("num_comments"),
+        "created_at": doc.created_at.isoformat(),
+    }
+
+
+async def _check_novelty_impl(idea: str, max_results: int = 10) -> str:
+    """Return JSON {"query", "prior_art": [...], "count", "note"} or 'Error: ...'."""
+    query = idea.strip()[:NOVELTY_QUERY_MAX_CHARS]
+    if not query:
+        return (
+            "Error: idea must not be empty — pass a short description or keywords "
+            "to check for prior art."
+        )
+
+    clamped = max(1, min(max_results, MAX_NOVELTY_RESULTS))
+    try:
+        settings = _base_settings(
+            require_reddit=False,
+            hn_tags="story",
+            hn_query=query,
+            hn_limit_per_tag=clamped,
+        )
+        adapter = HackerNewsAdapter(settings)
+        docs = await _collect(adapter)
+        payload = {
+            "query": query,
+            "prior_art": [_hn_prior_art_entry(doc) for doc in docs],
+            "count": len(docs),
+            "note": "Judge similarity yourself — this tool returns evidence, not verdicts.",
+        }
+        return json.dumps(payload, ensure_ascii=False)
+    except IngestionError as exc:
+        logger.exception("check_novelty fetch failed")
+        return f"Error: {type(exc).__name__}: {exc}"
+    except Exception as exc:
+        logger.exception("check_novelty fetch failed")
+        return f"Error: {type(exc).__name__}: {exc}"
+
+
+async def _detect_gaps_impl(
+    source: str = "hackernews",
+    tags: str = "ask_hn",
+    query: str = "",
+    limit: int = 25,
+) -> str:
+    """Return JSON {"gaps": [...], "doc_count", "gap_count"}, the key-missing guidance
+    message, or an 'Error: ...' string."""
+    if source != "hackernews":
+        return f"Error: source '{source}' is not supported in v1. Only 'hackernews' is available."
+
+    hn_overrides: dict[str, Any] = {
+        "hn_query": query,
+        "hn_limit_per_tag": _clamp_limit(limit),
+    }
+    if not _is_blank_csv(tags):
+        hn_overrides["hn_tags"] = tags
+
+    try:
+        settings = _base_settings(require_reddit=False, **hn_overrides)
+
+        if not _anthropic_key_present(settings):
+            return _ANTHROPIC_MISSING_MSG
+
+        adapter = HackerNewsAdapter(settings)
+        docs = await _collect(adapter)
+        # Inject a context-managed client so its httpx pool is closed per call —
+        # a self-constructed GapDetector client would leak on a long-lived server.
+        async with AsyncAnthropic(
+            api_key=settings.anthropic_api_key or None,
+            timeout=settings.gap_request_timeout_seconds,
+        ) as anthropic_client:
+            gaps = await GapDetector(settings, client=anthropic_client).detect(docs)
+        payload = {
+            "gaps": [gap.model_dump(mode="json") for gap in gaps],
+            "doc_count": len(docs),
+            "gap_count": len(gaps),
+        }
+        return json.dumps(payload, ensure_ascii=False)
+    except GapDetectionError as exc:
+        logger.exception("detect_gaps analysis failed")
+        return f"Error: {exc}"
+    except IngestionError as exc:
+        logger.exception("detect_gaps fetch failed")
+        return f"Error: {type(exc).__name__}: {exc}"
+    except Exception as exc:
+        logger.exception("detect_gaps failed")
+        return f"Error: {type(exc).__name__}: {exc}"
+
+
+@mcp.tool()
+async def check_novelty(idea: str, max_results: int = 10) -> str:
+    """Search Hacker News for prior art related to an idea (keyless, no API key needed).
+
+    Use this to sanity-check whether an idea already exists or has been discussed
+    before you invest in it. It searches Hacker News stories (via Algolia HN Search)
+    for posts matching your idea and returns them as EVIDENCE for you to judge — it
+    does NOT score similarity or decide whether your idea is novel. That judgment is
+    yours: read the returned titles, engagement, and links, then reason about overlap.
+
+    Args:
+        idea: a short description of the idea to check (a sentence or a few keywords).
+            Long strings are truncated before searching; keep it focused for best matches.
+        max_results: how many prior-art posts to return (default 10, clamped to 1..20).
+
+    Returns:
+        A JSON string:
+        {
+          "query": "<the search text actually sent to Hacker News>",
+          "prior_art": [
+            {"unique_key", "title", "url", "points", "num_comments", "created_at"}, ...
+          ],
+          "count": <number of results>,
+          "note": "Judge similarity yourself — this tool returns evidence, not verdicts."
+        }
+        An empty "prior_art" list (count 0) means no matching HN stories were found — that
+        is a signal, not an error. On failure, a plain string beginning "Error: ".
+    """
+    return await _check_novelty_impl(idea, max_results)
+
+
+@mcp.tool()
+async def detect_gaps(
+    source: str = "hackernews",
+    tags: str = "ask_hn",
+    query: str = "",
+    limit: int = 25,
+) -> str:
+    """Fetch demand-signal posts and analyze them for demand-supply GAPS (needs ANTHROPIC_API_KEY).
+
+    Use this when you want structured, evidence-cited gap candidates — problems where
+    demand looks strong but existing supply looks weak — rather than raw posts. It fetches
+    Hacker News posts and runs them through the gap-detection LLM analysis in one call.
+
+    This tool requires ANTHROPIC_API_KEY (it makes an LLM call). If the key is not set, it
+    returns a friendly message explaining how to set it AND the keyless alternative: call
+    fetch_hackernews and analyze the posts for gaps yourself.
+
+    Args:
+        source: data source; only "hackernews" is supported in v1 (anything else returns a
+            friendly error naming the supported source).
+        tags: comma-separated Algolia HN tags to fetch (e.g. "ask_hn", "ask_hn,show_hn").
+        query: optional free-text query to narrow the fetched posts; "" fetches all.
+        limit: max posts to fetch per tag before analysis (default 25, clamped to 1..100).
+
+    Returns:
+        A JSON string:
+        {
+          "gaps": [ <GapCandidate>, ... ],   # problem, evidence[{unique_key, quote}],
+                                             # demand_signal, supply_signal, confidence, metadata
+          "doc_count": <posts analyzed>,
+          "gap_count": <gaps found>
+        }
+        A GapDetectionError (LLM/API failure, invalid output) yields a string beginning
+        "Error: ". Missing ANTHROPIC_API_KEY yields the friendly guidance message.
+    """
+    return await _detect_gaps_impl(source, tags, query, limit)
 
 
 def _configure_logging() -> None:

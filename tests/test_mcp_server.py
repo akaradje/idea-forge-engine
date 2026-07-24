@@ -1,28 +1,40 @@
 """Tests for idea_forge.mcp_server (MCP stdio server exposing ingestion adapters).
 
-Covers spec acceptance criteria 1-14 (specs/2026-07-24-mcp-server.md §5).
-No real MCP client, no live network — adapters are monkeypatched with fakes that
-capture the Settings they were constructed with, or fail HTTP via respx where the
-real adapter classes are exercised end-to-end is not needed (thin transport layer
-over already-tested adapters).
+Covers spec acceptance criteria 1-14 (specs/2026-07-24-mcp-server.md §5) and
+criteria 1-15 for the product tools check_novelty/detect_gaps
+(specs/2026-07-24-mcp-product-tools.md §5).
+No real MCP client, no live network — adapters/detector are monkeypatched with
+fakes that capture the Settings they were constructed with, or fail via
+recorded exceptions where the real classes are exercised end-to-end is not
+needed (thin transport layer over already-tested adapters/detector).
 """
 
 import json
 import logging
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
+from unittest.mock import AsyncMock
 
 import pytest
 
 import idea_forge.mcp_server as mcp_server
+from idea_forge.gaps.errors import GapDetectionError
+from idea_forge.gaps.models import GapCandidate, GapEvidence
 from idea_forge.ingestion.base import RawDocument
 from idea_forge.ingestion.errors import AuthError, IngestionError, RateLimitError
 from idea_forge.mcp_server import (
+    _ANTHROPIC_MISSING_MSG,
     MAX_BODY_CHARS,
+    MAX_NOVELTY_RESULTS,
+    NOVELTY_QUERY_MAX_CHARS,
     _base_settings,
+    _check_novelty_impl,
+    _detect_gaps_impl,
     _fetch_hackernews_impl,
     _fetch_reddit_impl,
     _serialize,
+    check_novelty,
+    detect_gaps,
 )
 
 # --- helpers ----------------------------------------------------------------
@@ -97,9 +109,46 @@ def reset_fake(fake_cls: type[FakeAdapter], **kwargs) -> None:
     fake_cls.http_called = False
 
 
+class FakeGapDetector:
+    """Stand-in for gaps.detector.GapDetector: captures constructor Settings,
+    `detect()` is an AsyncMock returning a preset GapCandidate list or raising.
+    """
+
+    last_settings: "Settings | None" = None  # type: ignore[name-defined]  # noqa: F821
+    constructed = False
+    #: class-level so a test can set the return value / side effect before construction.
+    detect_return: "list[GapCandidate]" = ()  # type: ignore[assignment]
+    detect_side_effect: Exception | None = None
+
+    def __init__(self, settings, client=None) -> None:
+        type(self).last_settings = settings
+        type(self).constructed = True
+        if self.detect_side_effect is not None:
+            self.detect = AsyncMock(side_effect=self.detect_side_effect)
+        else:
+            self.detect = AsyncMock(return_value=self.detect_return)
+
+
+def reset_fake_gap_detector(**kwargs) -> None:
+    FakeGapDetector.last_settings = None
+    FakeGapDetector.constructed = False
+    FakeGapDetector.detect_return = kwargs.get("detect_return", [])
+    FakeGapDetector.detect_side_effect = kwargs.get("detect_side_effect")
+
+
+def make_gap(problem: str = "problem", unique_key: str = "hackernews:1") -> GapCandidate:
+    return GapCandidate(
+        problem=problem,
+        evidence=[GapEvidence(unique_key=unique_key, quote="quote")],
+        demand_signal="lots of complaints",
+        supply_signal="none observed",
+        confidence=0.8,
+    )
+
+
 @pytest.fixture(autouse=True)
 def _isolated_env(tmp_path, monkeypatch):
-    """No real .env / REDDIT_* env vars leak into these tests."""
+    """No real .env / REDDIT_* / ANTHROPIC_* env vars leak into these tests."""
     monkeypatch.chdir(tmp_path)
     for var in (
         "REDDIT_CLIENT_ID",
@@ -111,6 +160,7 @@ def _isolated_env(tmp_path, monkeypatch):
         "HN_TAGS",
         "HN_QUERY",
         "HN_LIMIT_PER_TAG",
+        "ANTHROPIC_API_KEY",
     ):
         monkeypatch.delenv(var, raising=False)
 
@@ -118,8 +168,10 @@ def _isolated_env(tmp_path, monkeypatch):
 @pytest.fixture(autouse=True)
 def _reset_fakes():
     reset_fake(FakeAdapter)
+    reset_fake_gap_detector()
     yield
     reset_fake(FakeAdapter)
+    reset_fake_gap_detector()
 
 
 # --- Criterion 1: HN impl returns {"documents": [...], "count": 3} ----------
@@ -457,3 +509,307 @@ def test_configure_logging_attaches_stderr_stream_handler():
         assert any(h.stream is sys.stderr for h in stream_handlers)
     finally:
         root_logger.handlers = original_handlers
+
+
+# =============================================================================
+# Product tools: check_novelty + detect_gaps
+# (specs/2026-07-24-mcp-product-tools.md §5, acceptance criteria 1-15)
+# =============================================================================
+
+
+# --- Criterion 1: check_novelty impl returns structured JSON evidence -------
+
+
+async def test_check_novelty_impl_returns_json_with_prior_art_and_note(monkeypatch):
+    docs = [
+        make_doc(
+            source="hackernews",
+            source_id=f"{i}",
+            title=f"Collab editor {i}",
+            metadata={"points": 10 + i, "num_comments": i},
+        )
+        for i in range(3)
+    ]
+    reset_fake(FakeAdapter, docs=docs)
+    monkeypatch.setattr(mcp_server, "HackerNewsAdapter", FakeAdapter)
+
+    result = await _check_novelty_impl("realtime collab editor", max_results=3)
+
+    assert isinstance(result, str)
+    payload = json.loads(result)
+    assert payload["query"] == "realtime collab editor"
+    assert payload["count"] == 3
+    assert len(payload["prior_art"]) == 3
+    for entry in payload["prior_art"]:
+        assert set(entry.keys()) == {
+            "unique_key",
+            "title",
+            "url",
+            "points",
+            "num_comments",
+            "created_at",
+        }
+    assert payload["note"] == (
+        "Judge similarity yourself — this tool returns evidence, not verdicts."
+    )
+
+
+# --- Criterion 2: check_novelty tool sets expected Settings overrides -------
+
+
+async def test_check_novelty_sets_hn_overrides_on_constructed_settings(monkeypatch):
+    reset_fake(FakeAdapter, docs=[])
+    monkeypatch.setattr(mcp_server, "HackerNewsAdapter", FakeAdapter)
+
+    await check_novelty("realtime collab editor", max_results=3)
+
+    settings = FakeAdapter.last_settings
+    assert settings is not None
+    assert settings.hn_tags == ["story"]
+    assert settings.hn_query == "realtime collab editor"
+    assert settings.hn_limit_per_tag == 3
+
+
+# --- Criterion 3: max_results clamps -----------------------------------------
+
+
+async def test_check_novelty_max_results_clamped_above_ceiling(monkeypatch):
+    reset_fake(FakeAdapter, docs=[])
+    monkeypatch.setattr(mcp_server, "HackerNewsAdapter", FakeAdapter)
+
+    await _check_novelty_impl("idea", max_results=1000)
+
+    assert FakeAdapter.last_settings.hn_limit_per_tag == MAX_NOVELTY_RESULTS
+    assert MAX_NOVELTY_RESULTS == 20
+
+
+async def test_check_novelty_max_results_clamped_below_min(monkeypatch):
+    reset_fake(FakeAdapter, docs=[])
+    monkeypatch.setattr(mcp_server, "HackerNewsAdapter", FakeAdapter)
+
+    await _check_novelty_impl("idea", max_results=0)
+
+    assert FakeAdapter.last_settings.hn_limit_per_tag == 1
+
+
+# --- Criterion 4: idea truncated to NOVELTY_QUERY_MAX_CHARS -----------------
+
+
+async def test_check_novelty_idea_truncated_to_max_chars_in_query_and_hn_query(monkeypatch):
+    reset_fake(FakeAdapter, docs=[])
+    monkeypatch.setattr(mcp_server, "HackerNewsAdapter", FakeAdapter)
+    long_idea = "x" * (NOVELTY_QUERY_MAX_CHARS + 100)
+
+    result = await _check_novelty_impl(long_idea)
+
+    payload = json.loads(result)
+    assert len(payload["query"]) == NOVELTY_QUERY_MAX_CHARS
+    assert FakeAdapter.last_settings.hn_query == "x" * NOVELTY_QUERY_MAX_CHARS
+
+
+# --- Criterion 5: blank idea -> friendly error, no adapter constructed -----
+
+
+async def test_check_novelty_blank_idea_returns_error_no_adapter_constructed(monkeypatch):
+    reset_fake(FakeAdapter)
+    monkeypatch.setattr(mcp_server, "HackerNewsAdapter", FakeAdapter)
+
+    result = await _check_novelty_impl("   ")
+
+    assert result.startswith("Error:")
+    assert "idea" in result
+    assert FakeAdapter.constructed is False
+
+
+# --- Criterion 6: points/num_comments present vs absent --------------------
+
+
+async def test_check_novelty_maps_points_and_comments_when_present(monkeypatch):
+    doc = make_doc(metadata={"points": 42, "num_comments": 7})
+    reset_fake(FakeAdapter, docs=[doc])
+    monkeypatch.setattr(mcp_server, "HackerNewsAdapter", FakeAdapter)
+
+    result = await _check_novelty_impl("idea")
+
+    entry = json.loads(result)["prior_art"][0]
+    assert entry["points"] == 42
+    assert entry["num_comments"] == 7
+
+
+async def test_check_novelty_maps_null_points_and_comments_when_absent(monkeypatch):
+    doc = make_doc(metadata={})
+    reset_fake(FakeAdapter, docs=[doc])
+    monkeypatch.setattr(mcp_server, "HackerNewsAdapter", FakeAdapter)
+
+    result = await _check_novelty_impl("idea")
+
+    entry = json.loads(result)["prior_art"][0]
+    assert entry["points"] is None
+    assert entry["num_comments"] is None
+
+
+# --- Criterion 7: zero docs -> valid empty result, not an error ------------
+
+
+async def test_check_novelty_zero_docs_returns_valid_empty_result(monkeypatch):
+    reset_fake(FakeAdapter, docs=[])
+    monkeypatch.setattr(mcp_server, "HackerNewsAdapter", FakeAdapter)
+
+    result = await _check_novelty_impl("idea")
+
+    payload = json.loads(result)
+    assert payload["prior_art"] == []
+    assert payload["count"] == 0
+
+
+# --- Criterion 8: adapter RateLimitError -> "Error:" string ----------------
+
+
+async def test_check_novelty_rate_limit_error_mapped_to_error_string(monkeypatch):
+    reset_fake(FakeAdapter, raise_on_fetch=RateLimitError)
+    monkeypatch.setattr(mcp_server, "HackerNewsAdapter", FakeAdapter)
+
+    result = await _check_novelty_impl("idea")
+
+    assert result.startswith("Error:")
+    assert "RateLimitError" in result
+
+
+# --- Criterion 9: detect_gaps unsupported source -> friendly error ---------
+
+
+async def test_detect_gaps_unsupported_source_returns_error_no_adapter_no_detector(monkeypatch):
+    reset_fake(FakeAdapter)
+    reset_fake_gap_detector()
+    monkeypatch.setattr(mcp_server, "HackerNewsAdapter", FakeAdapter)
+    monkeypatch.setattr(mcp_server, "GapDetector", FakeGapDetector)
+
+    result = await _detect_gaps_impl(source="reddit")
+
+    assert result.startswith("Error:")
+    assert "hackernews" in result
+    assert FakeAdapter.constructed is False
+    assert FakeGapDetector.constructed is False
+
+
+# --- Criterion 10: no key anywhere -> guidance message, no side effects ----
+
+
+async def test_detect_gaps_missing_key_returns_guidance_message_no_side_effects(monkeypatch):
+    reset_fake(FakeAdapter)
+    reset_fake_gap_detector()
+    monkeypatch.setattr(mcp_server, "HackerNewsAdapter", FakeAdapter)
+    monkeypatch.setattr(mcp_server, "GapDetector", FakeGapDetector)
+
+    result = await _detect_gaps_impl()
+
+    assert result == _ANTHROPIC_MISSING_MSG
+    assert "ANTHROPIC_API_KEY" in result
+    assert "fetch_hackernews" in result
+    assert not result.startswith("Error:")
+    assert FakeGapDetector.constructed is False
+    assert FakeAdapter.constructed is False
+
+
+# --- Criterion 11: key present -> fetch + detect, overrides propagate ------
+
+
+async def test_detect_gaps_with_key_returns_gaps_and_propagates_overrides(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    docs = [make_doc(source="hackernews", source_id=f"{i}") for i in range(4)]
+    reset_fake(FakeAdapter, docs=docs)
+    gaps = [make_gap("problem one"), make_gap("problem two")]
+    reset_fake_gap_detector(detect_return=gaps)
+    monkeypatch.setattr(mcp_server, "HackerNewsAdapter", FakeAdapter)
+    monkeypatch.setattr(mcp_server, "GapDetector", FakeGapDetector)
+
+    result = await _detect_gaps_impl(tags="ask_hn", query="agents", limit=5)
+
+    payload = json.loads(result)
+    assert payload["doc_count"] == 4
+    assert payload["gap_count"] == 2
+    assert len(payload["gaps"]) == 2
+    for gap in payload["gaps"]:
+        assert set(
+            ["problem", "evidence", "demand_signal", "supply_signal", "confidence"]
+        ).issubset(gap.keys())
+
+    settings = FakeAdapter.last_settings
+    assert settings.hn_tags == ["ask_hn"]
+    assert settings.hn_query == "agents"
+    assert settings.hn_limit_per_tag == 5
+
+
+# --- Criterion 12: detect_gaps limit clamped above ceiling -----------------
+
+
+async def test_detect_gaps_limit_clamped_above_max(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    reset_fake(FakeAdapter, docs=[])
+    reset_fake_gap_detector(detect_return=[])
+    monkeypatch.setattr(mcp_server, "HackerNewsAdapter", FakeAdapter)
+    monkeypatch.setattr(mcp_server, "GapDetector", FakeGapDetector)
+
+    await _detect_gaps_impl(limit=10000)
+
+    assert FakeAdapter.last_settings.hn_limit_per_tag == 100
+
+
+# --- Criterion 13: GapDetectionError from detect() -> "Error:" string ------
+
+
+async def test_detect_gaps_detection_error_mapped_to_error_string(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    reset_fake(FakeAdapter, docs=[make_doc()])
+    reset_fake_gap_detector(detect_side_effect=GapDetectionError("boom"))
+    monkeypatch.setattr(mcp_server, "HackerNewsAdapter", FakeAdapter)
+    monkeypatch.setattr(mcp_server, "GapDetector", FakeGapDetector)
+
+    result = await _detect_gaps_impl()
+
+    assert result.startswith("Error:")
+    assert "boom" in result
+
+
+# --- Criterion 14: zero fetched docs with key present -----------------------
+
+
+async def test_detect_gaps_zero_docs_with_key_present_returns_empty_valid_result(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    reset_fake(FakeAdapter, docs=[])
+    reset_fake_gap_detector(detect_return=[])
+    monkeypatch.setattr(mcp_server, "HackerNewsAdapter", FakeAdapter)
+    monkeypatch.setattr(mcp_server, "GapDetector", FakeGapDetector)
+
+    result = await _detect_gaps_impl()
+
+    payload = json.loads(result)
+    assert payload == {"gaps": [], "doc_count": 0, "gap_count": 0}
+
+
+# --- Criterion 15: module exposes the new product-tool interface -----------
+
+
+def test_module_exposes_check_novelty_and_detect_gaps_with_docstrings():
+    assert callable(mcp_server.check_novelty)
+    assert callable(mcp_server.detect_gaps)
+    assert callable(mcp_server._check_novelty_impl)
+    assert callable(mcp_server._detect_gaps_impl)
+    assert check_novelty.__doc__
+    assert detect_gaps.__doc__
+
+
+# --- Additional edge case: adapter fetch failure during detect_gaps --------
+
+
+async def test_detect_gaps_ingestion_error_during_fetch_returns_error_string(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    reset_fake(FakeAdapter, raise_on_fetch=IngestionError)
+    reset_fake_gap_detector()
+    monkeypatch.setattr(mcp_server, "HackerNewsAdapter", FakeAdapter)
+    monkeypatch.setattr(mcp_server, "GapDetector", FakeGapDetector)
+
+    result = await _detect_gaps_impl()
+
+    assert result.startswith("Error:")
+    assert FakeGapDetector.constructed is False
